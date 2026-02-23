@@ -1,6 +1,5 @@
 <?php
-// Judul: Xcodehoster Installer (PHP Version)
-// Repository: https://github.com/Miftaa3211/Tugaspkl
+//Judul: Xcodehoster Installer (PHP Version)
 
 function run($cmd) {
     passthru($cmd);
