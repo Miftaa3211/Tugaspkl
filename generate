@@ -1,0 +1,1 @@
+for i in {1..1000}; do < /dev/urandom tr -dc 'A-Za-z0-9' | head -c 8; echo; done > /usr/lib/cgi-bin/vouchers.txt
