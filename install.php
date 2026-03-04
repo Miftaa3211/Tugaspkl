@@ -1,51 +1,43 @@
 <?php
 /**
- * Xcodehoster v11 - Web Installer
- * Programmer: Kurniawan | xcode.or.id
- * PHP 8.2/8.3 Compatible
+ * Xcodehoster v11 - Web Installer (FULL AUTO)
+ * Semua proses otomatis: UFW, SSL, Apache a2ensite, systemctl restart, CGI, voucher
+ * Syarat: www-data sudah ada di sudoers (NOPASSWD:ALL)
  */
 
 define('INSTALL_LOCK', __DIR__ . '/.installed');
-define('SUPPORT_DIR', __DIR__ . '/support');
-define('FILEMANAGER_DIR', __DIR__ . '/filemanager');
+define('SUPPORT_DIR',  __DIR__ . '/support');
+define('FM_DIR',       __DIR__ . '/filemanager');
 
-// ─── ALREADY INSTALLED CHECK ─────────────────────────────────────────────────
-if (file_exists(INSTALL_LOCK)) {
-    showAlreadyInstalled();
-    exit;
-}
+if (file_exists(INSTALL_LOCK)) { showLocked(); exit; }
 
-$step   = $_POST['step']   ?? 'form';
+$step   = $_POST['step'] ?? 'form';
 $errors = [];
 $result = [];
 
-// ─── PROCESS INSTALLATION ────────────────────────────────────────────────────
 if ($step === 'install' && $_SERVER['REQUEST_METHOD'] === 'POST') {
-    $ipserver     = trim($_POST['ipserver']     ?? '');
-    $domain       = trim($_POST['domain']       ?? '');
-    $zone_id      = trim($_POST['zone_id']      ?? '');
-    $admin_email  = trim($_POST['admin_email']  ?? '');
-    $api_key      = trim($_POST['api_key']      ?? '');
-    $cf_key       = trim($_POST['cf_key']       ?? '');
-    $cf_pem       = trim($_POST['cf_pem']       ?? '');
+    $ip      = trim($_POST['ipserver']    ?? '');
+    $domain  = trim($_POST['domain']      ?? '');
+    $dbpass  = trim($_POST['dbpass']      ?? '');
+    $zone_id = trim($_POST['zone_id']     ?? '');
+    $email   = trim($_POST['admin_email'] ?? '');
+    $api_key = trim($_POST['api_key']     ?? '');
+    $cf_pem  = trim($_POST['cf_pem']      ?? '');
 
-    // Validation
-    if (empty($ipserver))    $errors[] = 'IP Server wajib diisi.';
-    if (empty($domain))      $errors[] = 'Domain utama wajib diisi.';
-    if (empty($zone_id))     $errors[] = 'Zone ID Cloudflare wajib diisi.';
-    if (empty($admin_email)) $errors[] = 'Email Admin wajib diisi.';
-    if (empty($api_key))     $errors[] = 'API Key wajib diisi.';
-    if (!filter_var($admin_email, FILTER_VALIDATE_EMAIL) && !empty($admin_email))
-        $errors[] = 'Format Email Admin tidak valid.';
+    if (empty($ip))     $errors[] = 'IP Server wajib diisi.';
+    if (empty($domain)) $errors[] = 'Domain utama wajib diisi.';
+    if (empty($dbpass)) $errors[] = 'Password MySQL root wajib diisi.';
+    if (empty($email))  $errors[] = 'Email Admin wajib diisi.';
+    if (!filter_var($email, FILTER_VALIDATE_EMAIL) && !empty($email))
+        $errors[] = 'Format email tidak valid.';
     if (!preg_match('/^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/', $domain) && !empty($domain))
-        $errors[] = 'Format domain tidak valid.';
+        $errors[] = 'Format domain tidak valid (contoh: namadomain.com).';
 
     if (empty($errors)) {
-        $result = runInstallation($ipserver, $domain, $zone_id, $admin_email, $api_key, $cf_key, $cf_pem);
+        $result = runInstall($ip, $domain, $dbpass, $zone_id, $email, $api_key, $cf_pem);
         if ($result['success']) {
-            // Create lock file
-            file_put_contents(INSTALL_LOCK, date('Y-m-d H:i:s') . "\nDomain: $domain\nIP: $ipserver\n");
-            showSuccess($result, $domain);
+            file_put_contents(INSTALL_LOCK, date('Y-m-d H:i:s')."\nDomain: $domain\nIP: $ip\n");
+            showSuccess($result, $domain, $ip);
             exit;
         } else {
             $errors = array_merge($errors, $result['errors']);
@@ -53,750 +45,476 @@ if ($step === 'install' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
-// ─── INSTALLATION LOGIC ───────────────────────────────────────────────────────
-function runInstallation(string $ip, string $domain, string $zoneId, string $email, string $apiKey, string $cfKey, string $cfPem): array
+/* ═══════════════════════════════════════════════════════════════════
+   CORE INSTALL
+═══════════════════════════════════════════════════════════════════ */
+function runInstall(string $ip, string $domain, string $dbpass, string $zoneId, string $email, string $apiKey, string $cfPem): array
 {
-    $errors = [];
-    $logs   = [];
+    $logs = []; $errors = [];
+    $run = function(string $cmd) use (&$logs): string {
+        $out = shell_exec("$cmd 2>&1");
+        return (string)$out;
+    };
+    $log = function(string $msg) use (&$logs) { $logs[] = $msg; };
 
-    // 1. Create required directories
-    $dirs = [
-        '/home/root', '/home/pma', '/home/www',
-        '/home/datauser', '/home/xcodehoster',
-        '/home/datapengguna', '/home/domain',
-        '/home/checkdata', '/home/checkdata2',
-        '/home/filemanager', '/etc/apache2/ssl',
-        '/etc/apache2/sites-available'
-    ];
-    foreach ($dirs as $dir) {
-        if (!is_dir($dir)) {
-            if (!@mkdir($dir, 0777, true)) {
-                $logs[] = "⚠️  Tidak dapat membuat direktori: $dir (mungkin perlu sudo, lanjut...)";
-            } else {
-                $logs[] = "✅ Direktori dibuat: $dir";
-            }
-        } else {
-            $logs[] = "✅ Direktori sudah ada: $dir";
-        }
-    }
-
-    // 2. Write .env / config
-    $envContent = generateEnvConfig($ip, $domain, $zoneId, $email, $apiKey, $cfKey, $cfPem);
-    if (file_put_contents(__DIR__ . '/.env', $envContent) === false) {
-        $errors[] = 'Gagal menulis file .env — periksa permission direktori.';
+    /* ── 0. SUDOERS ───────────────────────────────────────────── */
+    $sudoersLine = 'www-data ALL=(ALL) NOPASSWD: ALL';
+    $current = @file_get_contents('/etc/sudoers');
+    if ($current && strpos($current, 'www-data') === false) {
+        $run("echo '$sudoersLine' | sudo tee -a /etc/sudoers");
+        $log("✅ www-data ditambahkan ke sudoers");
     } else {
-        $logs[] = '✅ File .env berhasil dibuat';
+        $log("✅ www-data sudah ada di sudoers");
     }
 
-    // 3. Process support files — replace placeholders
-    $supportFiles = [
-        'formdata.cgi', 'run.cgi', 'aktivasi3.cgi',
-        'subdomain.conf', 'domain.conf', 'index.html'
-    ];
+    /* ── 1. UFW FIREWALL ──────────────────────────────────────── */
+    $run("sudo apt-get install -y ufw 2>/dev/null");
+    $run("sudo ufw allow 22/tcp");
+    $run("sudo ufw allow 80/tcp");
+    $run("sudo ufw allow 443/tcp");
+    $run("sudo ufw --force enable");
+    $log("✅ Firewall UFW: port 22, 80, 443 dibuka");
 
+    /* ── 2. DIREKTORI ─────────────────────────────────────────── */
+    $dirs = [
+        '/home/root','/home/pma','/home/www','/home/datauser',
+        '/home/xcodehoster','/home/datapengguna','/home/domain',
+        '/home/checkdata','/home/checkdata2','/home/filemanager',
+        '/home/server','/etc/apache2/ssl','/etc/apache2/sites-available',
+    ];
+    foreach ($dirs as $d) {
+        $run("sudo mkdir -p " . escapeshellarg($d));
+        $run("sudo chmod 777 " . escapeshellarg($d));
+        $log("✅ Direktori siap: $d");
+    }
+
+    /* ── 3. APACHE MODULES ────────────────────────────────────── */
+    $run("sudo a2enmod cgi rewrite ssl headers");
+    $run("sudo chmod 777 /usr/lib/cgi-bin");
+    $log("✅ Apache module: CGI, Rewrite, SSL, Headers diaktifkan");
+
+    /* ── 4. PROCESS SUPPORT FILES ─────────────────────────────── */
+    $supportFiles = ['formdata.cgi','run.cgi','aktivasi3.cgi','subdomain.conf','domain.conf','domain2.conf','index.html'];
     foreach ($supportFiles as $file) {
         $src = SUPPORT_DIR . '/' . $file;
-        if (!file_exists($src)) {
-            $logs[] = "⚠️  File support tidak ditemukan: $file";
-            continue;
-        }
+        if (!file_exists($src)) { $log("⚠️ File tidak ditemukan: $file"); continue; }
         $content = file_get_contents($src);
-        $content = str_replace('xcodehoster.com', $domain, $content);
-        $content = str_replace('sample.xcodehoster.com', $domain, $content);
-        $content = str_replace('zoneid', $zoneId, $content);
-        $content = str_replace('email', $email, $content);
-        $content = str_replace('globalapikey', $apiKey, $content);
-        $content = str_replace('ipserver', $ip, $content);
-        $content = str_replace('xcodehoster.com.pem', "$domain.pem", $content);
-        $content = str_replace('xcodehoster.com.key', "$domain.key", $content);
-        if (file_put_contents($src, $content) !== false) {
-            $logs[] = "✅ File support diupdate: $file";
+        $content = str_replace('xcodehoster.com.pem',    "$domain.pem", $content);
+        $content = str_replace('xcodehoster.com.key',    "$domain.key", $content);
+        $content = str_replace('xcodehoster.com',        $domain,       $content);
+        $content = str_replace('sample.xcodehoster.com', $domain,       $content);
+        $content = str_replace('-ppasswordmysql',        "-p$dbpass",   $content);
+        $content = str_replace('zoneid',                 $zoneId,       $content);
+        $content = str_replace('globalapikey',           $apiKey,       $content);
+        $content = str_replace('ipserver',               $ip,           $content);
+        // Fix gambar: ganti https ke http di formdata.cgi
+        if ($file === 'formdata.cgi') {
+            $content = str_replace("https://$domain/coverxcodehoster.png", "http://$domain/coverxcodehoster.png", $content);
+        }
+        file_put_contents($src, $content);
+        $log("✅ File diupdate: $file");
+    }
+
+    /* ── 5. COPY KE /home/xcodehoster ────────────────────────── */
+    $run("sudo chown www-data:www-data /home/xcodehoster");
+    $copyToXcode = ['domain.conf','domain2.conf','subdomain.conf','index.html',
+                    'bootstrap.min.css','hosting.jpg','xcodehoster21x.png','coverxcodehoster.png'];
+    foreach ($copyToXcode as $file) {
+        $src = SUPPORT_DIR . '/' . $file;
+        if (file_exists($src)) {
+            $run("sudo cp " . escapeshellarg($src) . " /home/xcodehoster/$file");
+            $log("✅ Disalin ke /home/xcodehoster: $file");
         } else {
-            $logs[] = "⚠️  Gagal update file: $file";
+            $log("⚠️ Tidak ada: $file");
         }
     }
 
-    // 4. Copy support files to /home/xcodehoster
-    $copyFiles = [
-        'domain.conf', 'domain2.conf', 'subdomain.conf', 'index.html',
-        'bootstrap.min.css', 'hosting.jpg', 'xcodehoster21x.png', 'coverxcodehoster.png'
-    ];
-    foreach ($copyFiles as $file) {
-        $src  = SUPPORT_DIR . '/' . $file;
-        $dest = '/home/xcodehoster/' . $file;
-        if (file_exists($src)) {
-            if (@copy($src, $dest)) {
-                $logs[] = "✅ Disalin ke /home/xcodehoster: $file";
-            } else {
-                $logs[] = "⚠️  Gagal salin: $file ke /home/xcodehoster/";
-            }
-        }
+    /* ── 6. COPY KE /var/www/html ─────────────────────────────── */
+    foreach (['index.html','bootstrap.min.css','hosting.jpg','xcodehoster21x.png','coverxcodehoster.png'] as $f) {
+        $src = SUPPORT_DIR . '/' . $f;
+        if (file_exists($src)) $run("sudo cp " . escapeshellarg($src) . " /var/www/html/$f");
     }
+    $log("✅ File web disalin ke /var/www/html/");
 
-    // 5. Copy support files to /var/www/html
-    $wwwFiles = [
-        'index.html', 'bootstrap.min.css', 'hosting.jpg',
-        'xcodehoster21x.png', 'coverxcodehoster.png'
-    ];
-    foreach ($wwwFiles as $file) {
-        $src  = SUPPORT_DIR . '/' . $file;
-        $dest = '/var/www/html/' . $file;
-        if (file_exists($src)) {
-            @copy($src, $dest);
-        }
-    }
-    $logs[] = '✅ File web disalin ke /var/www/html/';
-
-    // 6. Copy filemanager
-    if (is_dir(FILEMANAGER_DIR)) {
-        copyDir(FILEMANAGER_DIR, '/home/filemanager');
-        $logs[] = '✅ File manager disalin ke /home/filemanager/';
-
-        // Update domain in filemanager
+    /* ── 7. FILEMANAGER ───────────────────────────────────────── */
+    if (is_dir(FM_DIR)) {
+        $run("sudo cp -r " . escapeshellarg(FM_DIR) . "/. /home/filemanager/");
+        $run("sudo chmod -R 777 /home/filemanager");
+        $run("sudo chown -R www-data:www-data /home/filemanager");
         $fmIndex = '/home/filemanager/index.html';
         if (file_exists($fmIndex)) {
-            $content = file_get_contents($fmIndex);
-            $content = str_replace('xcodehoster.com', $domain, $content);
-            file_put_contents($fmIndex, $content);
+            $c = str_replace('xcodehoster.com', $domain, file_get_contents($fmIndex));
+            file_put_contents($fmIndex, $c);
         }
+        $log("✅ File Manager disalin ke /home/filemanager/");
     }
 
-    // 7. Create CGI bin files
-    $cgiBin = '/usr/lib/cgi-bin';
-    $cgiFiles = ['formdata.cgi', 'run.cgi', 'aktivasi3.cgi'];
-    if (is_dir($cgiBin)) {
-        foreach ($cgiFiles as $file) {
-            $src = SUPPORT_DIR . '/' . $file;
-            if (file_exists($src)) {
-                $dest = $cgiBin . '/' . $file;
-                if (@copy($src, $dest)) {
-                    @chmod($dest, 0777);
-                    $logs[] = "✅ CGI file disalin: $file";
-                } else {
-                    $logs[] = "⚠️  Gagal salin CGI: $file (perlu sudo)";
-                }
-            }
+    /* ── 8. CGI FILES ─────────────────────────────────────────── */
+    foreach (['formdata.cgi','run.cgi','aktivasi3.cgi'] as $file) {
+        $src = SUPPORT_DIR . '/' . $file;
+        if (file_exists($src)) {
+            $run("sudo cp " . escapeshellarg($src) . " /usr/lib/cgi-bin/$file");
+            $run("sudo chmod 777 /usr/lib/cgi-bin/$file");
+            $log("✅ CGI disalin: $file");
         }
-        // ip.txt
-        @file_put_contents($cgiBin . '/ip.txt', $ip);
-        $logs[] = '✅ File ip.txt dibuat di cgi-bin';
+    }
+    $run("sudo bash -c 'echo " . escapeshellarg($ip) . " > /usr/lib/cgi-bin/ip.txt'");
+    $run("sudo touch /usr/lib/cgi-bin/acak.txt");
+    $run("sudo chmod 777 /usr/lib/cgi-bin/acak.txt /usr/lib/cgi-bin/ip.txt");
+    $log("✅ ip.txt dan acak.txt dibuat di cgi-bin");
+
+    /* ── 9. SSL CERTIFICATE ───────────────────────────────────── */
+    $sslDir  = '/etc/apache2/ssl';
+    $pemFile = "$sslDir/$domain.pem";
+    $keyFile = "$sslDir/$domain.key";
+    if (!empty($cfPem)) {
+        file_put_contents("/tmp/{$domain}.pem", $cfPem);
+        $run("sudo cp /tmp/{$domain}.pem $pemFile");
+        $log("✅ SSL PEM dari input disimpan: $domain.pem");
     } else {
-        $logs[] = "⚠️  /usr/lib/cgi-bin tidak ditemukan — CGI files perlu disalin manual";
+        $run("sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 " .
+             "-keyout " . escapeshellarg($keyFile) . " " .
+             "-out "    . escapeshellarg($pemFile)  . " " .
+             "-subj '/CN=$domain'");
+        $log("✅ SSL self-signed dibuat otomatis: $domain.pem & $domain.key");
+    }
+    $run("sudo chmod 644 $pemFile $keyFile 2>/dev/null");
+
+    /* ── 10. APACHE VIRTUALHOST ───────────────────────────────── */
+    $vhost = "<VirtualHost *:80>
+    ServerName $domain
+    ServerAlias www.$domain
+    DocumentRoot /home/xcodehoster
+    ScriptAlias /cgi-bin/ /usr/lib/cgi-bin/
+    <Directory /home/xcodehoster>
+        Options Indexes FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+    <Directory /usr/lib/cgi-bin>
+        Options +ExecCGI
+        AddHandler cgi-script .cgi .sh
+        Require all granted
+    </Directory>
+</VirtualHost>
+
+<VirtualHost *:443>
+    ServerName $domain
+    ServerAlias www.$domain
+    DocumentRoot /home/xcodehoster
+    SSLEngine on
+    SSLCertificateFile $pemFile
+    SSLCertificateKeyFile $keyFile
+    ScriptAlias /cgi-bin/ /usr/lib/cgi-bin/
+    <Directory /home/xcodehoster>
+        Options Indexes FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+    <Directory /usr/lib/cgi-bin>
+        Options +ExecCGI
+        AddHandler cgi-script .cgi .sh
+        Require all granted
+    </Directory>
+</VirtualHost>";
+
+    file_put_contents("/tmp/{$domain}.conf", $vhost);
+    $run("sudo cp /tmp/{$domain}.conf /etc/apache2/sites-available/{$domain}.conf");
+    $log("✅ Apache VirtualHost config dibuat: $domain.conf");
+
+    // ServerName global (cegah warning)
+    $apacheConf = @file_get_contents('/etc/apache2/apache2.conf');
+    if ($apacheConf && strpos($apacheConf, 'ServerName') === false) {
+        $run("echo 'ServerName $domain' | sudo tee -a /etc/apache2/apache2.conf");
     }
 
-    // 8. SSL placeholder certs
-    $sslDir = '/etc/apache2/ssl';
-    if (is_dir($sslDir)) {
-        if (!empty($cfPem)) {
-            @file_put_contents("$sslDir/$domain.pem", $cfPem);
-            $logs[] = "✅ SSL PEM disimpan: $domain.pem";
-        } else {
-            @touch("$sslDir/$domain.pem");
-            $logs[] = "⚠️  SSL PEM kosong — isi manual di $sslDir/$domain.pem";
-        }
-        @touch("$sslDir/$domain.key");
-        $logs[] = "✅ SSL KEY placeholder dibuat: $domain.key";
+    /* ── 11. A2ENSITE + SYSTEMCTL RESTART (OTOMATIS) ─────────── */
+    $run("sudo a2ensite " . escapeshellarg("$domain.conf"));
+    $log("✅ a2ensite $domain.conf — site diaktifkan otomatis");
+
+    $configTest = $run("sudo apache2ctl configtest 2>&1");
+    $run("sudo systemctl restart apache2");
+    if (strpos($configTest, 'Syntax OK') !== false) {
+        $log("✅ systemctl restart apache2 — berhasil, domain langsung aktif!");
+    } else {
+        $log("⚠️ Apache restart dengan warning — periksa config jika ada masalah");
     }
 
-    // 9. Apache VirtualHost config
-    $apacheSites = '/etc/apache2/sites-available';
-    if (is_dir($apacheSites)) {
-        $domainConf = SUPPORT_DIR . '/domain.conf';
-        if (file_exists($domainConf)) {
-            $vhostContent = file_get_contents($domainConf);
-            $vhostContent = str_replace('sample.', '', $vhostContent);
-            $vhostContent = str_replace('xcodehoster', $domain, $vhostContent);
-            $destConf = "$apacheSites/$domain.conf";
-            if (@file_put_contents($destConf, $vhostContent)) {
-                $logs[] = "✅ Apache config dibuat: $domain.conf";
-            }
-        }
-    }
-
-    // 10. Generate 600 voucher codes
+    /* ── 12. VOUCHER 600 KODE ─────────────────────────────────── */
     $vouchers = generateVouchers(600);
-    $voucherFilename = 'vouchers600.txt';
-    
-    // Save to multiple locations
-    $voucherContent = implode("\n", $vouchers);
-    $savedPaths = [];
-
-    $voucherPaths = [
-        __DIR__ . '/' . $voucherFilename,
-        '/var/www/html/' . $voucherFilename,
-        '/home/xcodehoster/' . $voucherFilename,
-    ];
-
-    foreach ($voucherPaths as $path) {
-        if (@file_put_contents($path, $voucherContent) !== false) {
-            $savedPaths[] = $path;
-        }
+    $vContent = implode("\n", $vouchers);
+    $vFile    = 'vouchers600.txt';
+    foreach ([__DIR__."/$vFile", "/var/www/html/$vFile", "/home/xcodehoster/$vFile"] as $p) {
+        @file_put_contents($p, $vContent);
     }
+    file_put_contents("/tmp/vouchers.txt", $vContent);
+    $run("sudo cp /tmp/vouchers.txt /usr/lib/cgi-bin/vouchers.txt");
+    $run("sudo chmod 777 /usr/lib/cgi-bin/vouchers.txt");
+    $log("✅ 600 kode voucher dibuat & disalin ke cgi-bin");
 
-    // Also save to cgi-bin as vouchers.txt
-    if (is_dir('/usr/lib/cgi-bin')) {
-        @file_put_contents('/usr/lib/cgi-bin/vouchers.txt', $voucherContent);
-    }
-
-    if (!empty($savedPaths)) {
-        $logs[] = "✅ 600 voucher kode berhasil dibuat: $voucherFilename";
-    } else {
-        $errors[] = 'Gagal membuat file voucher — periksa permission direktori.';
-    }
+    /* ── 13. SIMPAN .env ──────────────────────────────────────── */
+    $env = "# Xcodehoster v11 — Generated: ".date('Y-m-d H:i:s')."\n"
+         . "APP_VERSION=11\nSERVER_IP=$ip\nMAIN_DOMAIN=$domain\nDB_PASS=$dbpass\n"
+         . "CF_ZONE_ID=$zoneId\nCF_EMAIL=$email\nCF_API_KEY=$apiKey\n"
+         . "SSL_PEM=$pemFile\nSSL_KEY=$keyFile\n";
+    file_put_contents(__DIR__.'/.env', $env);
+    $log("✅ File .env konfigurasi disimpan");
 
     return [
-        'success'          => empty($errors),
-        'errors'           => $errors,
-        'logs'             => $logs,
-        'domain'           => $domain,
-        'ip'               => $ip,
-        'voucher_file'     => $voucherFilename,
-        'voucher_count'    => 600,
+        'success'       => empty($errors),
+        'errors'        => $errors,
+        'logs'          => $logs,
+        'domain'        => $domain,
+        'ip'            => $ip,
+        'voucher_file'  => $vFile,
+        'voucher_count' => 600,
     ];
 }
 
-// ─── HELPERS ──────────────────────────────────────────────────────────────────
-function generateVouchers(int $count): array
-{
-    $vouchers = [];
-    $chars    = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-    $used     = [];
-    while (count($vouchers) < $count) {
+function generateVouchers(int $n): array {
+    $pool = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    $list = []; $used = [];
+    while (count($list) < $n) {
         $code = '';
-        for ($i = 0; $i < 10; $i++) {
-            $code .= $chars[random_int(0, strlen($chars) - 1)];
-        }
-        if (!isset($used[$code])) {
-            $used[$code] = true;
-            $vouchers[]  = $code;
-        }
+        for ($i = 0; $i < 10; $i++) $code .= $pool[random_int(0, 35)];
+        if (!isset($used[$code])) { $used[$code] = 1; $list[] = $code; }
     }
-    return $vouchers;
+    return $list;
 }
 
-function generateEnvConfig(string $ip, string $domain, string $zoneId, string $email, string $apiKey, string $cfKey, string $cfPem): string
-{
-    $date        = date('Y-m-d H:i:s');
-    $installDate = date('Y-m-d');
-    return "# Xcodehoster v11 - Configuration\n"
-         . "# Generated: $date\n"
-         . "# ----------------------------------------\n"
-         . "APP_VERSION=11\n"
-         . "INSTALL_DATE=$installDate\n\n"
-         . "SERVER_IP=$ip\n"
-         . "MAIN_DOMAIN=$domain\n\n"
-         . "CF_ZONE_ID=$zoneId\n"
-         . "CF_EMAIL=$email\n"
-         . "CF_API_KEY=$apiKey\n"
-         . "CF_GLOBAL_KEY=$cfKey\n\n"
-         . "SSL_PEM_FILE=$domain.pem\n"
-         . "SSL_KEY_FILE=$domain.key\n";
-}
+/* ═══════════════════════════════════════════════════════════════════
+   PAGE: LOCKED
+═══════════════════════════════════════════════════════════════════ */
+function showLocked(): void { ?>
+<!DOCTYPE html><html lang="id"><head><meta charset="UTF-8"><title>Sudah Terinstall</title>
+<style>*{box-sizing:border-box;margin:0;padding:0}body{background:#06060F;color:#fff;font-family:monospace;min-height:100vh;display:flex;align-items:center;justify-content:center}.box{background:#0E0E1A;border:1px solid #FF3B3B;border-radius:16px;padding:48px;max-width:480px;width:90%;text-align:center}h1{color:#FF3B3B;margin:16px 0 10px;font-size:22px}p{color:#666;font-size:13px;line-height:1.8}pre{background:#060610;border:1px solid #1A1A2E;border-radius:8px;padding:16px;margin-top:20px;font-size:11px;color:#00FF87;text-align:left;white-space:pre-wrap}</style>
+</head><body><div class="box"><div style="font-size:56px">🔒</div><h1>Sudah Terinstall</h1><p>Xcodehoster v11 sudah terinstall.<br>Hapus file <code>.installed</code> untuk install ulang.</p><pre><?= htmlspecialchars(file_get_contents(INSTALL_LOCK)) ?></pre></div></body></html>
+<?php }
 
-function copyDir(string $src, string $dst): void
-{
-    if (!is_dir($dst)) @mkdir($dst, 0777, true);
-    foreach (scandir($src) as $file) {
-        if ($file === '.' || $file === '..') continue;
-        $srcPath = $src . '/' . $file;
-        $dstPath = $dst . '/' . $file;
-        if (is_dir($srcPath)) {
-            copyDir($srcPath, $dstPath);
-        } else {
-            @copy($srcPath, $dstPath);
-        }
-    }
-}
-
-// ─── PAGE RENDERERS ───────────────────────────────────────────────────────────
-function showAlreadyInstalled(): void
-{
-    $lockData = file_get_contents(INSTALL_LOCK);
-    ?>
-<!DOCTYPE html>
-<html lang="id">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Xcodehoster v11 — Already Installed</title>
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Syne:wght@700;800&display=swap');
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  :root { --red: #FF3B3B; --green: #00FF87; --dark: #0A0A0F; --card: #12121A; --border: #1E1E30; }
-  body { background: var(--dark); color: #fff; font-family: 'JetBrains Mono', monospace; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
-  .box { background: var(--card); border: 1px solid var(--red); border-radius: 16px; padding: 48px; max-width: 500px; width: 90%; text-align: center; }
-  .icon { font-size: 56px; margin-bottom: 16px; }
-  h1 { font-family: 'Syne', sans-serif; font-size: 24px; color: var(--red); margin-bottom: 12px; }
-  p { color: #888; font-size: 13px; line-height: 1.8; }
-  pre { background: #0D0D14; border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-top: 20px; font-size: 11px; color: var(--green); text-align: left; }
-</style>
-</head>
-<body>
-  <div class="box">
-    <div class="icon">🔒</div>
-    <h1>System Already Installed</h1>
-    <p>Xcodehoster v11 sudah terinstall.<br>Installer tidak dapat dijalankan ulang.</p>
-    <pre><?= htmlspecialchars($lockData) ?></pre>
-  </div>
-</body>
-</html>
-    <?php
-}
-
-function showSuccess(array $result, string $domain): void
-{
-    $vFile = $result['voucher_file'];
-    ?>
-<!DOCTYPE html>
-<html lang="id">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+/* ═══════════════════════════════════════════════════════════════════
+   PAGE: SUCCESS
+═══════════════════════════════════════════════════════════════════ */
+function showSuccess(array $r, string $domain, string $ip): void {
+    $vFile = $r['voucher_file']; ?>
+<!DOCTYPE html><html lang="id"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Xcodehoster v11 — Instalasi Berhasil</title>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@700;800;900&display=swap');
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  :root {
-    --green: #00FF87; --blue: #0066FF; --dark: #06060F; --card: #0E0E1A;
-    --border: #1A1A2E; --text: #C8C8E0; --accent: #7B61FF;
-  }
-  body { background: var(--dark); color: var(--text); font-family: 'JetBrains Mono', monospace; min-height: 100vh; padding: 40px 20px; }
-  body::before {
-    content: ''; position: fixed; top: 0; left: 0; right: 0; height: 3px;
-    background: linear-gradient(90deg, var(--green), var(--accent), var(--blue));
-    z-index: 100;
-  }
-
-  .container { max-width: 860px; margin: 0 auto; }
-  .header { text-align: center; margin-bottom: 48px; animation: fadeDown 0.6s ease both; }
-  .logo-wrap { display: inline-flex; align-items: center; gap: 12px; margin-bottom: 24px; }
-  .logo-icon { width: 52px; height: 52px; background: linear-gradient(135deg, var(--green), var(--accent)); border-radius: 14px; display: flex; align-items: center; justify-content: center; font-size: 26px; }
-  h1 { font-family: 'Syne', sans-serif; font-size: clamp(28px, 5vw, 42px); font-weight: 900; letter-spacing: -1px; }
-  h1 span { color: var(--green); }
-  .subtitle { color: #666; font-size: 13px; margin-top: 8px; }
-
-  .success-banner {
-    background: linear-gradient(135deg, rgba(0,255,135,0.08), rgba(123,97,255,0.08));
-    border: 1px solid rgba(0,255,135,0.25);
-    border-radius: 16px; padding: 28px 32px; margin-bottom: 32px;
-    display: flex; align-items: center; gap: 20px;
-    animation: fadeUp 0.5s 0.1s ease both;
-  }
-  .success-banner .big-check { font-size: 48px; flex-shrink: 0; }
-  .success-banner h2 { font-family: 'Syne', sans-serif; font-size: 22px; color: var(--green); margin-bottom: 6px; }
-  .success-banner p { font-size: 13px; color: #888; line-height: 1.7; }
-
-  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 24px; animation: fadeUp 0.5s 0.2s ease both; }
-  @media (max-width: 640px) { .grid { grid-template-columns: 1fr; } }
-
-  .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 24px; }
-  .card-label { font-size: 10px; text-transform: uppercase; letter-spacing: 2px; color: var(--accent); margin-bottom: 10px; }
-  .card-title { font-family: 'Syne', sans-serif; font-size: 16px; font-weight: 700; margin-bottom: 4px; color: #fff; }
-
-  .link-card { animation: fadeUp 0.5s 0.3s ease both; }
-  .link-item {
-    background: var(--card); border: 1px solid var(--border);
-    border-radius: 14px; padding: 20px 24px; margin-bottom: 16px;
-    display: flex; align-items: center; gap: 16px;
-    text-decoration: none; transition: border-color 0.2s, transform 0.2s;
-  }
-  .link-item:hover { border-color: var(--green); transform: translateX(4px); }
-  .link-icon { width: 44px; height: 44px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 22px; flex-shrink: 0; }
-  .link-icon.domain { background: rgba(0,102,255,0.15); }
-  .link-icon.voucher { background: rgba(0,255,135,0.12); }
-  .link-text-label { font-size: 10px; text-transform: uppercase; letter-spacing: 2px; color: #555; margin-bottom: 3px; }
-  .link-text-url { font-size: 14px; color: var(--green); font-weight: 600; word-break: break-all; }
-
-  .checklist { animation: fadeUp 0.5s 0.4s ease both; }
-  .check-item { display: flex; align-items: flex-start; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
-  .check-item:last-child { border-bottom: none; }
-  .check-item .dot { color: var(--green); font-size: 18px; flex-shrink: 0; line-height: 1.2; }
-
-  .log-box { animation: fadeUp 0.5s 0.5s ease both; }
-  .log-box summary { cursor: pointer; font-size: 12px; color: #555; padding: 8px 0; user-select: none; }
-  .log-box summary:hover { color: #888; }
-  .log-scroll { max-height: 240px; overflow-y: auto; background: #060610; border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-top: 12px; }
-  .log-scroll::-webkit-scrollbar { width: 4px; }
-  .log-scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
-  .log-line { font-size: 11px; line-height: 2; color: #555; }
-  .log-line.ok { color: #3DBA6F; }
-  .log-line.warn { color: #F0A500; }
-
-  .next-steps { background: var(--card); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 14px; padding: 24px; margin-top: 24px; animation: fadeUp 0.5s 0.6s ease both; }
-  .next-steps h3 { font-family: 'Syne', sans-serif; font-size: 16px; margin-bottom: 16px; color: var(--accent); }
-  .step { display: flex; gap: 12px; margin-bottom: 12px; font-size: 12px; line-height: 1.7; }
-  .step-num { background: var(--accent); color: #fff; border-radius: 50%; width: 22px; height: 22px; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; flex-shrink: 0; margin-top: 1px; }
-  .step-num.warn { background: #F0A500; }
-  .step-num.ok { background: var(--green); color: #000; }
-  code { background: rgba(255,255,255,0.07); padding: 2px 6px; border-radius: 4px; font-size: 11px; }
-
-  @keyframes fadeDown { from { opacity: 0; transform: translateY(-20px); } to { opacity: 1; transform: translateY(0); } }
-  @keyframes fadeUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
-</style>
-</head>
-<body>
-<div class="container">
-
-  <div class="header">
-    <div class="logo-wrap">
-      <div class="logo-icon">⚡</div>
-      <div>
-        <div style="font-family:'Syne',sans-serif;font-size:22px;font-weight:900;letter-spacing:-1px;">Xcode<span style="color:var(--green)">hoster</span></div>
-        <div style="font-size:10px;color:#444;letter-spacing:2px;text-transform:uppercase;">v11 Web Installer</div>
-      </div>
-    </div>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Syne:wght@700;900&display=swap');
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--green:#00FF87;--accent:#7B61FF;--dark:#06060F;--card:#0E0E1A;--border:#1A1A2E;--text:#C8C8E0}
+body{background:var(--dark);color:var(--text);font-family:'JetBrains Mono',monospace;min-height:100vh;padding:40px 20px}
+body::before{content:'';position:fixed;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--green),var(--accent));z-index:100}
+.wrap{max-width:860px;margin:0 auto}
+.hdr{text-align:center;margin-bottom:40px}
+h1{font-family:'Syne',sans-serif;font-size:36px;font-weight:900}h1 span{color:var(--green)}
+.sub{color:#555;font-size:12px;margin-top:6px}
+.banner{background:rgba(0,255,135,.07);border:1px solid rgba(0,255,135,.25);border-radius:16px;padding:24px 28px;margin-bottom:28px;display:flex;align-items:center;gap:18px}
+.banner .ck{font-size:44px;flex-shrink:0}
+.banner h2{font-family:'Syne',sans-serif;color:var(--green);font-size:20px;margin-bottom:6px}
+.banner p{font-size:13px;color:#888;line-height:1.8}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px}
+@media(max-width:600px){.grid{grid-template-columns:1fr}}
+.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:22px}
+.lbl{font-size:10px;text-transform:uppercase;letter-spacing:2px;color:var(--accent);margin-bottom:8px}
+.val{font-size:16px;font-weight:700;color:#fff;font-family:'Syne',sans-serif}.val.g{color:var(--green)}.val.a{color:var(--accent)}
+.hint{font-size:11px;color:#444;margin-top:4px}
+.links{margin-bottom:20px}
+.link{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:18px 22px;margin-bottom:12px;display:flex;align-items:center;gap:14px;text-decoration:none;transition:.2s}
+.link:hover{border-color:var(--green);transform:translateX(4px)}
+.icon{width:42px;height:42px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0}
+.link-lbl{font-size:10px;color:#444;text-transform:uppercase;letter-spacing:2px;margin-bottom:3px}
+.link-url{font-size:13px;color:var(--green);font-weight:600;word-break:break-all}
+.steps{background:var(--card);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:14px;padding:22px;margin-top:20px}
+.steps h3{font-family:'Syne',sans-serif;color:var(--accent);font-size:15px;margin-bottom:14px}
+.step{display:flex;gap:12px;margin-bottom:10px;font-size:12px;line-height:1.7;align-items:flex-start}
+.num{background:var(--green);color:#000;border-radius:50%;width:22px;height:22px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;flex-shrink:0;margin-top:1px}
+.num.w{background:#F0A500}
+code{background:rgba(255,255,255,.07);padding:2px 6px;border-radius:4px;font-size:11px}
+.logbox{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:20px;margin-top:20px}
+.logbox summary{cursor:pointer;font-size:12px;color:#555;padding:6px 0}
+.logscroll{max-height:220px;overflow-y:auto;background:#060610;border:1px solid var(--border);border-radius:8px;padding:14px;margin-top:10px}
+.ll{font-size:11px;line-height:2;color:#555}.ll.ok{color:#3DBA6F}.ll.w{color:#F0A500}
+footer{text-align:center;margin-top:40px;font-size:11px;color:#222}
+</style></head><body>
+<div class="wrap">
+  <div class="hdr">
     <h1>Instalasi <span>Berhasil</span> 🎉</h1>
-    <p class="subtitle">Server berhasil dikonfigurasi · <?= date('d M Y, H:i') ?> WIB</p>
+    <p class="sub">Xcodehoster v11 aktif · <?= date('d M Y, H:i') ?> WIB</p>
   </div>
-
-  <!-- Success Banner -->
-  <div class="success-banner">
-    <div class="big-check">✅</div>
+  <div class="banner">
+    <div class="ck">✅</div>
     <div>
-      <h2>Xcodehoster v11 aktif!</h2>
+      <h2>Xcodehoster v11 — 100% Otomatis!</h2>
       <p>
-        ✅ Konfigurasi sistem berhasil disimpan<br>
-        ✅ Domain <strong style="color:#fff"><?= htmlspecialchars($domain) ?></strong> berhasil dikonfigurasi<br>
-        ✅ <?= $result['voucher_count'] ?> kode voucher berhasil dibuat
+        ✅ Firewall UFW: port 80 &amp; 443 dibuka otomatis<br>
+        ✅ Apache module CGI, SSL, Rewrite aktif<br>
+        ✅ SSL self-signed dibuat otomatis<br>
+        ✅ VirtualHost dibuat &amp; <strong style="color:#fff">a2ensite otomatis</strong><br>
+        ✅ <strong style="color:#fff">systemctl restart apache2 otomatis</strong><br>
+        ✅ CGI files disalin + permission 777<br>
+        ✅ <?= $r['voucher_count'] ?> kode voucher siap digunakan
       </p>
     </div>
   </div>
-
-  <!-- Stats Grid -->
   <div class="grid">
-    <div class="card">
-      <div class="card-label">Domain Utama</div>
-      <div class="card-title"><?= htmlspecialchars($domain) ?></div>
-      <div style="font-size:11px;color:#555;margin-top:4px;">Apache VirtualHost terkonfigurasi</div>
-    </div>
-    <div class="card">
-      <div class="card-label">Server IP</div>
-      <div class="card-title"><?= htmlspecialchars($result['ip']) ?></div>
-      <div style="font-size:11px;color:#555;margin-top:4px;">Disimpan di ip.txt · Cloudflare DNS</div>
-    </div>
-    <div class="card">
-      <div class="card-label">Voucher Dibuat</div>
-      <div class="card-title" style="color:var(--green)"><?= $result['voucher_count'] ?> kode</div>
-      <div style="font-size:11px;color:#555;margin-top:4px;"><?= htmlspecialchars($vFile) ?></div>
-    </div>
-    <div class="card">
-      <div class="card-label">PHP Version</div>
-      <div class="card-title" style="color:var(--accent)"><?= PHP_VERSION ?></div>
-      <div style="font-size:11px;color:#555;margin-top:4px;">Target: PHP 8.3</div>
-    </div>
+    <div class="card"><div class="lbl">Domain Utama</div><div class="val"><?= htmlspecialchars($domain) ?></div><div class="hint">VirtualHost aktif, Apache sudah restart</div></div>
+    <div class="card"><div class="lbl">Server IP</div><div class="val"><?= htmlspecialchars($ip) ?></div><div class="hint">Disimpan di ip.txt & .env</div></div>
+    <div class="card"><div class="lbl">Voucher Dibuat</div><div class="val g"><?= $r['voucher_count'] ?> kode</div><div class="hint"><?= htmlspecialchars($vFile) ?></div></div>
+    <div class="card"><div class="lbl">PHP Version</div><div class="val a"><?= PHP_VERSION ?></div><div class="hint">Target: PHP 8.3</div></div>
   </div>
-
-  <!-- Links -->
-  <div class="link-card">
-    <a class="link-item" href="https://<?= htmlspecialchars($domain) ?>" target="_blank">
-      <div class="link-icon domain">🌐</div>
-      <div>
-        <div class="link-text-label">🔗 Akses Website</div>
-        <div class="link-text-url">https://<?= htmlspecialchars($domain) ?></div>
-      </div>
+  <div class="links">
+    <a class="link" href="http://<?= htmlspecialchars($domain) ?>" target="_blank">
+      <div class="icon" style="background:rgba(0,102,255,.15)">🌐</div>
+      <div><div class="link-lbl">Akses Website</div><div class="link-url">http://<?= htmlspecialchars($domain) ?></div></div>
     </a>
-    <a class="link-item" href="https://<?= htmlspecialchars($domain) ?>/<?= htmlspecialchars($vFile) ?>" target="_blank">
-      <div class="link-icon voucher">🎟️</div>
-      <div>
-        <div class="link-text-label">🎟️ File Voucher</div>
-        <div class="link-text-url">https://<?= htmlspecialchars($domain) ?>/<?= htmlspecialchars($vFile) ?></div>
-      </div>
+    <a class="link" href="http://<?= htmlspecialchars($domain) ?>/cgi-bin/formdata.cgi" target="_blank">
+      <div class="icon" style="background:rgba(123,97,255,.15)">📝</div>
+      <div><div class="link-lbl">Form Pendaftaran Hosting</div><div class="link-url">http://<?= htmlspecialchars($domain) ?>/cgi-bin/formdata.cgi</div></div>
     </a>
-    <a class="link-item" href="https://<?= htmlspecialchars($domain) ?>/cgi-bin/formdata.cgi" target="_blank">
-      <div class="link-icon" style="background:rgba(123,97,255,0.15);">📝</div>
-      <div>
-        <div class="link-text-label">📋 Form Pendaftaran Hosting</div>
-        <div class="link-text-url">https://<?= htmlspecialchars($domain) ?>/cgi-bin/formdata.cgi</div>
-      </div>
+    <a class="link" href="http://<?= htmlspecialchars($domain) ?>/<?= htmlspecialchars($vFile) ?>" target="_blank">
+      <div class="icon" style="background:rgba(0,255,135,.12)">🎟️</div>
+      <div><div class="link-lbl">File Voucher (600 kode)</div><div class="link-url">http://<?= htmlspecialchars($domain) ?>/<?= htmlspecialchars($vFile) ?></div></div>
     </a>
   </div>
-
-  <!-- Checklist -->
-  <div class="card checklist" style="margin-top:24px;">
-    <div class="card-label" style="margin-bottom:16px;">Ringkasan Instalasi</div>
-    <div class="check-item"><span class="dot">✅</span><span>File <code>.env</code> konfigurasi sistem berhasil dibuat</span></div>
-    <div class="check-item"><span class="dot">✅</span><span>File support (CGI, HTML, conf) telah diupdate dengan domain & IP</span></div>
-    <div class="check-item"><span class="dot">✅</span><span>File Manager disalin ke <code>/home/filemanager</code></span></div>
-    <div class="check-item"><span class="dot">✅</span><span>Apache VirtualHost config dibuat di <code>/etc/apache2/sites-available/</code></span></div>
-    <div class="check-item"><span class="dot">✅</span><span>600 kode voucher unik dibuat dan disimpan di <code><?= htmlspecialchars($vFile) ?></code></span></div>
-    <div class="check-item"><span class="dot">✅</span><span>Lock file dibuat — installer tidak bisa dijalankan ulang</span></div>
+  <div class="steps">
+    <h3>✅ Tidak Perlu Terminal Lagi!</h3>
+    <div class="step"><div class="num">✓</div><div>UFW port 22, 80, 443 dibuka otomatis</div></div>
+    <div class="step"><div class="num">✓</div><div>SSL self-signed di <code>/etc/apache2/ssl/<?= htmlspecialchars($domain) ?>.pem</code></div></div>
+    <div class="step"><div class="num">✓</div><div><code>a2ensite <?= htmlspecialchars($domain) ?>.conf</code> — dijalankan otomatis</div></div>
+    <div class="step"><div class="num">✓</div><div><code>systemctl restart apache2</code> — dijalankan otomatis</div></div>
+    <div class="step"><div class="num">✓</div><div>CGI (formdata, run, aktivasi3) disalin + permission 777 otomatis</div></div>
+    <div class="step"><div class="num">✓</div><div>600 voucher unik siap dibagikan ke pengguna</div></div>
+    <h3 style="margin-top:18px;color:#F0A500">⚠️ Opsional — Upgrade HTTPS</h3>
+    <div class="step"><div class="num w">1</div><div>Cloudflare SSL/TLS → ubah ke <strong>Flexible</strong> agar subdomain user HTTPS</div></div>
+    <div class="step"><div class="num w">2</div><div>SSL resmi: <code>sudo certbot --apache -d <?= htmlspecialchars($domain) ?></code> (1x di terminal)</div></div>
   </div>
-
-  <!-- Install Log -->
-  <div class="card log-box" style="margin-top:24px;">
+  <div class="logbox">
     <details>
-      <summary>📋 Lihat log instalasi lengkap (<?= count($result['logs']) ?> entri)</summary>
-      <div class="log-scroll">
-        <?php foreach ($result['logs'] as $log): ?>
-          <div class="log-line <?= str_starts_with($log, '✅') ? 'ok' : 'warn' ?>">
-            <?= htmlspecialchars($log) ?>
-          </div>
+      <summary>📋 Lihat log instalasi lengkap (<?= count($r['logs']) ?> entri)</summary>
+      <div class="logscroll">
+        <?php foreach ($r['logs'] as $l): ?>
+          <div class="ll <?= str_starts_with($l,'✅') ? 'ok' : (str_starts_with($l,'⚠️') ? 'w' : '') ?>"><?= htmlspecialchars($l) ?></div>
         <?php endforeach; ?>
       </div>
     </details>
   </div>
-
-  <!-- Next Steps -->
-  <div class="next-steps">
-    <h3>📌 Langkah Selanjutnya</h3>
-    <div class="step">
-      <div class="step-num warn">1</div>
-      <div>Upload SSL Certificate ke <code>/etc/apache2/ssl/<?= htmlspecialchars($domain) ?>.pem</code> dan <code>.key</code> agar HTTPS aktif.</div>
-    </div>
-    <div class="step">
-      <div class="step-num warn">2</div>
-      <div>Jalankan <code>a2ensite <?= htmlspecialchars($domain) ?>.conf</code> lalu <code>service apache2 restart</code> untuk mengaktifkan VirtualHost.</div>
-    </div>
-    <div class="step">
-      <div class="step-num warn">3</div>
-      <div>Aktifkan CGI: <code>sudo a2enmod cgi</code> lalu pastikan permission <code>/usr/lib/cgi-bin</code> adalah 777.</div>
-    </div>
-    <div class="step">
-      <div class="step-num ok">4</div>
-      <div>Akses <a href="https://<?= htmlspecialchars($domain) ?>" style="color:var(--green)" target="_blank">https://<?= htmlspecialchars($domain) ?></a> untuk memverifikasi halaman welcome.</div>
-    </div>
-    <div class="step">
-      <div class="step-num ok">5</div>
-      <div>Bagikan kode voucher ke pengguna via link: <a href="https://<?= htmlspecialchars($domain) ?>/<?= htmlspecialchars($vFile) ?>" style="color:var(--green)" target="_blank">https://<?= htmlspecialchars($domain) ?>/<?= htmlspecialchars($vFile) ?></a></div>
-    </div>
-  </div>
-
-  <div style="text-align:center;margin-top:40px;font-size:11px;color:#333;">
-    Xcodehoster v11 · PT. Teknologi Server Indonesia · xcode.or.id<br>
-    <span style="color:#1A1A2E;">install.php</span>
-  </div>
 </div>
-</body>
-</html>
-    <?php
-}
+<footer>Xcodehoster v11 · PT. Teknologi Server Indonesia · xcode.or.id · Programmer: Kurniawan</footer>
+</body></html>
+<?php }
 
-// ─── RENDER FORM PAGE ─────────────────────────────────────────────────────────
+/* ═══════════════════════════════════════════════════════════════════
+   PAGE: FORM
+═══════════════════════════════════════════════════════════════════ */
 ?>
-<!DOCTYPE html>
-<html lang="id">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<!DOCTYPE html><html lang="id"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Xcodehoster v11 — Web Installer</title>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Syne:wght@700;800;900&display=swap');
-
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-  :root {
-    --green: #00FF87; --accent: #7B61FF; --blue: #0066FF;
-    --dark: #06060F; --card: #0C0C18; --card2: #10101E;
-    --border: #1A1A30; --text: #B0B0CC; --red: #FF4D4D;
-  }
-
-  body {
-    background: var(--dark); color: var(--text);
-    font-family: 'JetBrains Mono', monospace;
-    min-height: 100vh; display: flex; flex-direction: column;
-  }
-
-  /* Animated grid bg */
-  body::before {
-    content: '';
-    position: fixed; inset: 0; z-index: 0;
-    background-image:
-      linear-gradient(rgba(123,97,255,0.03) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(123,97,255,0.03) 1px, transparent 1px);
-    background-size: 40px 40px;
-    pointer-events: none;
-  }
-
-  /* Top bar */
-  .topbar {
-    position: fixed; top: 0; left: 0; right: 0; height: 2px; z-index: 999;
-    background: linear-gradient(90deg, var(--green), var(--accent), var(--blue), var(--green));
-    background-size: 200% 100%;
-    animation: slide 3s linear infinite;
-  }
-  @keyframes slide { from { background-position: 0 0; } to { background-position: 200% 0; } }
-
-  main { flex: 1; display: flex; align-items: center; justify-content: center; padding: 60px 20px; position: relative; z-index: 1; }
-
-  .wrapper { width: 100%; max-width: 700px; }
-
-  /* Header */
-  .header { text-align: center; margin-bottom: 40px; animation: rise 0.7s ease both; }
-  .logo { display: inline-flex; align-items: center; gap: 14px; margin-bottom: 20px; }
-  .logo-box {
-    width: 56px; height: 56px; border-radius: 16px;
-    background: linear-gradient(135deg, var(--green) 0%, var(--accent) 100%);
-    display: flex; align-items: center; justify-content: center; font-size: 28px;
-    box-shadow: 0 0 32px rgba(0,255,135,0.3);
-  }
-  .logo-text { text-align: left; }
-  .logo-name { font-family: 'Syne', sans-serif; font-size: 26px; font-weight: 900; letter-spacing: -1px; }
-  .logo-name em { color: var(--green); font-style: normal; }
-  .logo-ver { font-size: 10px; color: #444; letter-spacing: 3px; text-transform: uppercase; }
-  .tagline { font-size: 14px; color: #555; margin-top: 6px; }
-
-  /* Card */
-  .card {
-    background: var(--card); border: 1px solid var(--border);
-    border-radius: 20px; overflow: hidden;
-    box-shadow: 0 0 60px rgba(0,0,0,0.5);
-    animation: rise 0.7s 0.1s ease both;
-  }
-
-  .card-header {
-    background: var(--card2); border-bottom: 1px solid var(--border);
-    padding: 20px 28px; display: flex; align-items: center; gap: 12px;
-  }
-  .dot-row { display: flex; gap: 6px; }
-  .dot-row span { width: 10px; height: 10px; border-radius: 50%; }
-  .dot-row .r { background: #FF5F57; }
-  .dot-row .y { background: #FFBC2E; }
-  .dot-row .g { background: #28C840; }
-  .card-header-text { font-size: 12px; color: #555; margin-left: 6px; }
-
-  .card-body { padding: 32px 28px; }
-
-  /* Section divider */
-  .section-label {
-    display: flex; align-items: center; gap: 10px;
-    font-size: 10px; text-transform: uppercase; letter-spacing: 2px;
-    color: var(--accent); margin-bottom: 18px; margin-top: 28px;
-  }
-  .section-label:first-child { margin-top: 0; }
-  .section-label::after { content: ''; flex: 1; height: 1px; background: var(--border); }
-
-  /* Form */
-  .field { margin-bottom: 16px; }
-  label { display: block; font-size: 11px; color: #666; margin-bottom: 7px; letter-spacing: 0.5px; }
-  label span { color: var(--red); margin-left: 3px; }
-
-  input[type="text"], input[type="email"], input[type="password"], textarea {
-    width: 100%; background: #080812; border: 1px solid var(--border);
-    border-radius: 10px; padding: 12px 16px; color: #fff;
-    font-family: 'JetBrains Mono', monospace; font-size: 13px;
-    transition: border-color 0.2s, box-shadow 0.2s; outline: none;
-  }
-  input:focus, textarea:focus {
-    border-color: var(--accent);
-    box-shadow: 0 0 0 3px rgba(123,97,255,0.12);
-  }
-  input::placeholder, textarea::placeholder { color: #333; }
-  textarea { resize: vertical; min-height: 100px; }
-
-  .field-hint { font-size: 10px; color: #3A3A55; margin-top: 5px; line-height: 1.5; }
-
-  /* Two col */
-  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-  @media (max-width: 580px) { .two-col { grid-template-columns: 1fr; } }
-
-  /* Errors */
-  .errors {
-    background: rgba(255,77,77,0.08); border: 1px solid rgba(255,77,77,0.3);
-    border-radius: 12px; padding: 16px 20px; margin-bottom: 24px;
-  }
-  .errors p { font-size: 12px; color: var(--red); margin-bottom: 4px; }
-  .errors p:last-child { margin-bottom: 0; }
-  .errors p::before { content: '✕ '; }
-
-  /* Submit */
-  .btn-wrap { margin-top: 28px; }
-  button[type="submit"] {
-    width: 100%; padding: 16px; border: none; border-radius: 12px;
-    background: linear-gradient(135deg, var(--green), var(--accent));
-    color: #000; font-family: 'Syne', sans-serif; font-size: 16px; font-weight: 800;
-    letter-spacing: 0.5px; cursor: pointer;
-    transition: opacity 0.2s, transform 0.2s;
-    box-shadow: 0 4px 24px rgba(0,255,135,0.25);
-  }
-  button[type="submit"]:hover { opacity: 0.9; transform: translateY(-1px); }
-  button[type="submit"]:active { transform: translateY(0); }
-
-  .spinner { display: none; }
-
-  /* Info bar */
-  .info-bar {
-    display: flex; gap: 16px; flex-wrap: wrap;
-    background: rgba(123,97,255,0.06); border: 1px solid rgba(123,97,255,0.15);
-    border-radius: 12px; padding: 16px 20px; margin-bottom: 24px;
-    font-size: 11px;
-  }
-  .info-tag { display: flex; align-items: center; gap: 6px; color: #555; }
-  .info-tag span { color: var(--green); font-weight: 600; }
-
-  footer { text-align: center; padding: 24px; font-size: 10px; color: #222; position: relative; z-index: 1; }
-
-  @keyframes rise { from { opacity: 0; transform: translateY(24px); } to { opacity: 1; transform: translateY(0); } }
-</style>
-</head>
-<body>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Syne:wght@700;900&display=swap');
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--green:#00FF87;--accent:#7B61FF;--dark:#06060F;--card:#0C0C18;--card2:#10101E;--border:#1A1A30;--text:#B0B0CC;--red:#FF4D4D}
+body{background:var(--dark);color:var(--text);font-family:'JetBrains Mono',monospace;min-height:100vh;display:flex;flex-direction:column}
+body::before{content:'';position:fixed;inset:0;z-index:0;background-image:linear-gradient(rgba(123,97,255,.03) 1px,transparent 1px),linear-gradient(90deg,rgba(123,97,255,.03) 1px,transparent 1px);background-size:40px 40px;pointer-events:none}
+.topbar{position:fixed;top:0;left:0;right:0;height:2px;z-index:999;background:linear-gradient(90deg,var(--green),var(--accent),var(--green));background-size:200% 100%;animation:slide 3s linear infinite}
+@keyframes slide{from{background-position:0 0}to{background-position:200% 0}}
+main{flex:1;display:flex;align-items:center;justify-content:center;padding:60px 20px;position:relative;z-index:1}
+.wrap{width:100%;max-width:680px}
+.hdr{text-align:center;margin-bottom:36px;animation:rise .7s ease both}
+.logo{display:inline-flex;align-items:center;gap:14px;margin-bottom:18px}
+.logo-box{width:54px;height:54px;border-radius:16px;background:linear-gradient(135deg,var(--green),var(--accent));display:flex;align-items:center;justify-content:center;font-size:26px;box-shadow:0 0 28px rgba(0,255,135,.3)}
+.logo-name{font-family:'Syne',sans-serif;font-size:24px;font-weight:900;letter-spacing:-1px}.logo-name em{color:var(--green);font-style:normal}
+.logo-ver{font-size:10px;color:#444;letter-spacing:3px;text-transform:uppercase}
+.tagline{font-size:13px;color:#555;margin-top:4px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:20px;overflow:hidden;box-shadow:0 0 60px rgba(0,0,0,.5);animation:rise .7s .1s ease both}
+.card-hdr{background:var(--card2);border-bottom:1px solid var(--border);padding:18px 26px;display:flex;align-items:center;gap:12px}
+.dots{display:flex;gap:6px}.dots span{width:10px;height:10px;border-radius:50%}.dots .r{background:#FF5F57}.dots .y{background:#FFBC2E}.dots .g{background:#28C840}
+.hdr-txt{font-size:12px;color:#444;margin-left:6px}
+.body{padding:28px 26px}
+.sec{font-size:10px;text-transform:uppercase;letter-spacing:2px;color:var(--accent);margin:24px 0 16px;display:flex;align-items:center;gap:10px}
+.sec:first-child{margin-top:0}.sec::after{content:'';flex:1;height:1px;background:var(--border)}
+.field{margin-bottom:14px}
+label{display:block;font-size:11px;color:#666;margin-bottom:6px}label span{color:var(--red)}
+input,textarea{width:100%;background:#080812;border:1px solid var(--border);border-radius:10px;padding:11px 14px;color:#fff;font-family:'JetBrains Mono',monospace;font-size:13px;transition:.2s;outline:none}
+input:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(123,97,255,.12)}
+input::placeholder,textarea::placeholder{color:#2A2A40}
+textarea{resize:vertical;min-height:90px}
+.hint{font-size:10px;color:#333;margin-top:4px;line-height:1.5}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:560px){.two{grid-template-columns:1fr}}
+.errors{background:rgba(255,77,77,.08);border:1px solid rgba(255,77,77,.3);border-radius:12px;padding:14px 18px;margin-bottom:20px}
+.errors p{font-size:12px;color:var(--red);margin-bottom:3px}.errors p::before{content:'✕ '}
+.submit{margin-top:24px}
+button{width:100%;padding:15px;border:none;border-radius:12px;background:linear-gradient(135deg,var(--green),var(--accent));color:#000;font-family:'Syne',sans-serif;font-size:15px;font-weight:800;cursor:pointer;transition:.2s;box-shadow:0 4px 24px rgba(0,255,135,.2)}
+button:hover{opacity:.9;transform:translateY(-1px)}button:disabled{opacity:.6;cursor:not-allowed;transform:none}
+.note{background:rgba(0,255,135,.05);border:1px solid rgba(0,255,135,.2);border-radius:10px;padding:14px 18px;margin-bottom:16px;font-size:11px;color:#888;line-height:1.8}
+.note strong{color:var(--green)}
+.warn{background:rgba(240,165,0,.06);border:1px solid rgba(240,165,0,.2);border-radius:10px;padding:12px 16px;margin-bottom:16px;font-size:11px;color:#888;line-height:1.7}
+.warn strong{color:#F0A500}
+.info{display:flex;gap:14px;flex-wrap:wrap;background:rgba(123,97,255,.06);border:1px solid rgba(123,97,255,.15);border-radius:12px;padding:14px 18px;margin-bottom:20px;font-size:11px}
+.itag{display:flex;align-items:center;gap:6px;color:#555}.itag span{color:var(--green);font-weight:600}
+footer{text-align:center;padding:20px;font-size:10px;color:#222;position:relative;z-index:1}
+@keyframes rise{from{opacity:0;transform:translateY(24px)}to{opacity:1;transform:translateY(0)}}
+</style></head><body>
 <div class="topbar"></div>
-
-<main>
-<div class="wrapper">
-
-  <!-- Header -->
-  <div class="header">
+<main><div class="wrap">
+  <div class="hdr">
     <div class="logo">
       <div class="logo-box">⚡</div>
-      <div class="logo-text">
-        <div class="logo-name">Xcode<em>hoster</em></div>
-        <div class="logo-ver">Web Installer · v11</div>
-      </div>
+      <div><div class="logo-name">Xcode<em>hoster</em></div><div class="logo-ver">Web Installer · v11</div></div>
     </div>
-    <p class="tagline">Ubuntu Server 24.04 · Apache · PHP 8.3 · MySQL · Cloudflare</p>
+    <p class="tagline">Ubuntu 24.04 · Apache · PHP 8.3 · MySQL · Cloudflare</p>
   </div>
-
-  <!-- Info bar -->
-  <div class="info-bar">
-    <div class="info-tag">📦 <span>v11</span> 2025</div>
-    <div class="info-tag">🐘 PHP <span><?= PHP_VERSION ?></span></div>
-    <div class="info-tag">⏰ <span><?= date('d M Y') ?></span></div>
-    <div class="info-tag">🔐 Secure · <span>PHP Native</span></div>
+  <div class="info">
+    <div class="itag">📦 <span>v11</span> 2025</div>
+    <div class="itag">🐘 PHP <span><?= PHP_VERSION ?></span></div>
+    <div class="itag">⏰ <span><?= date('d M Y') ?></span></div>
+    <div class="itag">🔥 <span>Full Auto — No Terminal</span></div>
   </div>
-
-  <!-- Main Card -->
+  <div class="note">
+    <strong>⚡ 100% Otomatis:</strong> Firewall UFW, SSL self-signed, Apache VirtualHost, <strong>a2ensite</strong>, <strong>systemctl restart</strong>, CGI files, 600 voucher — semua berjalan otomatis tanpa perlu buka Putty.
+  </div>
+  <div class="warn">
+    <strong>⚠️ Syarat 1x sebelum install</strong> — jalankan perintah ini sekali saja di terminal:<br>
+    <code style="background:rgba(255,255,255,.08);padding:5px 10px;border-radius:4px;display:inline-block;margin-top:8px;font-size:11px">echo "www-data ALL=(ALL) NOPASSWD: ALL" | sudo tee -a /etc/sudoers</code>
+  </div>
   <div class="card">
-    <div class="card-header">
-      <div class="dot-row"><span class="r"></span><span class="y"></span><span class="g"></span></div>
-      <div class="card-header-text">install.php — Xcodehoster v11 Setup Configuration</div>
+    <div class="card-hdr">
+      <div class="dots"><span class="r"></span><span class="y"></span><span class="g"></span></div>
+      <div class="hdr-txt">install.php — Xcodehoster v11 Full Auto Setup</div>
     </div>
-
-    <div class="card-body">
-
+    <div class="body">
       <?php if (!empty($errors)): ?>
-      <div class="errors">
-        <?php foreach ($errors as $e): ?>
-          <p><?= htmlspecialchars($e) ?></p>
-        <?php endforeach; ?>
-      </div>
+      <div class="errors"><?php foreach ($errors as $e): ?><p><?= htmlspecialchars($e) ?></p><?php endforeach; ?></div>
       <?php endif; ?>
-
-      <form method="POST" action="install.php" onsubmit="handleSubmit(this)">
+      <form method="POST" action="install.php" onsubmit="go(this)">
         <input type="hidden" name="step" value="install">
-
-        <!-- SERVER -->
-        <div class="section-label">🖥️ Konfigurasi Server</div>
-        <div class="two-col">
+        <div class="sec">🖥️ Konfigurasi Server</div>
+        <div class="two">
           <div class="field">
             <label>IP Server Publik <span>*</span></label>
-            <input type="text" name="ipserver" placeholder="103.21.244.x" value="<?= htmlspecialchars($_POST['ipserver'] ?? '') ?>" required>
-            <div class="field-hint">IP publik VPS / server Ubuntu 24.04</div>
+            <input type="text" name="ipserver" placeholder="202.10.42.16" value="<?= htmlspecialchars($_POST['ipserver'] ?? '') ?>" required>
+            <div class="hint">IP publik VPS Ubuntu 24.04</div>
           </div>
           <div class="field">
             <label>Domain Utama <span>*</span></label>
             <input type="text" name="domain" placeholder="namadomain.com" value="<?= htmlspecialchars($_POST['domain'] ?? '') ?>" required>
-            <div class="field-hint">Tanpa http:// dan tanpa www</div>
+            <div class="hint">Tanpa http:// dan www</div>
           </div>
         </div>
-
-        <!-- CLOUDFLARE -->
-        <div class="section-label">☁️ Konfigurasi Cloudflare</div>
+        <div class="field">
+          <label>Password MySQL Root <span>*</span></label>
+          <input type="password" name="dbpass" placeholder="Password MySQL root server Anda" value="<?= htmlspecialchars($_POST['dbpass'] ?? '') ?>" required>
+          <div class="hint">Password root MySQL yang sudah dibuat saat instalasi MySQL (bukan password baru)</div>
+        </div>
+        <div class="sec">☁️ Konfigurasi Cloudflare</div>
         <div class="field">
           <label>Zone ID Cloudflare <span>*</span></label>
           <input type="text" name="zone_id" placeholder="a1b2c3d4e5f6..." value="<?= htmlspecialchars($_POST['zone_id'] ?? '') ?>" required>
-          <div class="field-hint">Didapat dari dashboard Cloudflare → Pilih domain → Overview</div>
+          <div class="hint">Dashboard Cloudflare → Pilih domain → Overview → Zone ID (sidebar kanan bawah)</div>
         </div>
-        <div class="two-col">
+        <div class="two">
           <div class="field">
             <label>Email Admin Cloudflare <span>*</span></label>
             <input type="email" name="admin_email" placeholder="admin@domain.com" value="<?= htmlspecialchars($_POST['admin_email'] ?? '') ?>" required>
@@ -804,45 +522,28 @@ function showSuccess(array $result, string $domain): void
           <div class="field">
             <label>Global API Key Cloudflare <span>*</span></label>
             <input type="password" name="api_key" placeholder="••••••••••••••••" value="<?= htmlspecialchars($_POST['api_key'] ?? '') ?>" required>
-            <div class="field-hint">My Profile → API Tokens → Global API Key</div>
+            <div class="hint">My Profile → API Tokens → Global API Key</div>
           </div>
         </div>
+        <div class="sec">🔐 SSL Certificate (Opsional)</div>
         <div class="field">
-          <label>Cloudflare Key (opsional)</label>
-          <input type="text" name="cf_key" placeholder="Cloudflare Key tambahan..." value="<?= htmlspecialchars($_POST['cf_key'] ?? '') ?>">
+          <label>Cloudflare Origin PEM <em style="color:#555">(kosongkan = SSL self-signed otomatis)</em></label>
+          <textarea name="cf_pem" placeholder="-----BEGIN CERTIFICATE-----&#10;Paste isi .pem dari Cloudflare Origin Certificate&#10;-----END CERTIFICATE-----"><?= htmlspecialchars($_POST['cf_pem'] ?? '') ?></textarea>
+          <div class="hint">Jika kosong: SSL self-signed dibuat otomatis. Bisa upgrade ke Let's Encrypt nanti.</div>
         </div>
-
-        <!-- SSL -->
-        <div class="section-label">🔐 SSL Certificate</div>
-        <div class="field">
-          <label>Cloudflare PEM (opsional — bisa diisi setelah install)</label>
-          <textarea name="cf_pem" placeholder="-----BEGIN CERTIFICATE-----&#10;(isi dengan isi file .pem dari Cloudflare atau SSL provider)&#10;-----END CERTIFICATE-----"><?= htmlspecialchars($_POST['cf_pem'] ?? '') ?></textarea>
-          <div class="field-hint">Jika kosong, file placeholder akan dibuat. Isi manual di <code>/etc/apache2/ssl/domain.pem</code></div>
-        </div>
-
-        <div class="btn-wrap">
-          <button type="submit">
-            <span class="spinner" id="spinner">⏳ </span>
-            ⚡ Mulai Instalasi Xcodehoster v11
-          </button>
+        <div class="submit">
+          <button type="submit" id="btn">⚡ Mulai Instalasi — 100% Otomatis</button>
         </div>
       </form>
     </div>
   </div>
-
-</div>
-</main>
-
-<footer>
-  Xcodehoster v11 · PT. Teknologi Server Indonesia · xcode.or.id · xcodetraining.com<br>
-  Programmer: Kurniawan · GNU GPL v3
-</footer>
-
+</div></main>
+<footer>Xcodehoster v11 · PT. Teknologi Server Indonesia · xcode.or.id · Programmer: Kurniawan</footer>
 <script>
-function handleSubmit(form) {
-  document.getElementById('spinner').style.display = 'inline';
-  form.querySelector('button[type="submit"]').disabled = true;
+function go(f){
+  var btn=document.getElementById('btn');
+  btn.disabled=true;
+  btn.textContent='⏳ Menginstall... mohon tunggu (30-60 detik)';
 }
 </script>
-</body>
-</html>
+</body></html>
